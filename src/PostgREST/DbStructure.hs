@@ -26,7 +26,7 @@ import           Data.Text                     (split, strip,
 import qualified Data.Text                     as T
 import qualified Hasql.Session                 as H
 import           PostgREST.Types
-import           Text.InterpolatedString.Perl6 (q)
+import           Text.InterpolatedString.Perl6 (q, qc)
 
 import           GHC.Exts                      (groupWith)
 import           Protolude
@@ -36,12 +36,12 @@ getDbStructure :: Schema -> PgVersion -> H.Session DbStructure
 getDbStructure schema pgVer = do
   tabs      <- H.statement () allTables
   cols      <- H.statement schema $ allColumns tabs
-  syns      <- H.statement schema $ allSynonyms cols
+  syns      <- H.statement schema $ allSynonyms cols pgVer
   childRels <- H.statement () $ allChildRelations tabs cols
   keys      <- H.statement () $ allPrimaryKeys tabs
   procs     <- H.statement schema allProcs
 
-  let rels = addManyToManyRelations . addParentRelations $ addViewRelations syns childRels
+  let rels = addManyToManyRelations . addParentRelations $ addViewChildRelations syns childRels
       cols' = addForeignKeys rels cols
       keys' = addViewPrimaryKeys syns keys
 
@@ -243,32 +243,32 @@ Having a Relation{relTable=t1, relColumns=[c1], relFTable=t2, relFColumns=[c2], 
 
 t1.c1------t2.c2
 
-When only having a t1_view.c1 synonym, we need to add a View to Table Relation
+When only having a t1_view.c1 synonym, we need to add a View to Table Child Relation
 
          t1.c1----t2.c2         t1.c1----------t2.c2
-                         ->            --------/
+                         ->            ________/
                                       /
       t1_view.c1             t1_view.c1
 
 
-When only having a t2_view.c2 synonym, we need to add a Table to View Relation
+When only having a t2_view.c2 synonym, we need to add a Table to View Child Relation
 
          t1.c1----t2.c2               t1.c1----------t2.c2
-                               ->          \--------
+                               ->          \________
                                                     \
                     t2_view.c2                      t2_view.c1
 
-When having t1_view.c1 and a t2_view.c2 synonyms, we need to add a View to View Relation in addition to the prior
+When having t1_view.c1 and a t2_view.c2 synonyms, we need to add a View to View Child Relation in addition to the prior
 
          t1.c1----t2.c2               t1.c1----------t2.c2
-                               ->          \--------/
+                               ->          \________/
                                            /        \
     t1_view.c1     t2_view.c2     t1_view.c1-------t2_view.c1
 
 The logic for composite pks is similar just need to make sure all the Relation columns have synonyms.
 -}
-addViewRelations :: [Synonym] -> [Relation] -> [Relation]
-addViewRelations allSyns = concatMap (\rel ->
+addViewChildRelations :: [Synonym] -> [Relation] -> [Relation]
+addViewChildRelations allSyns = concatMap (\rel ->
   rel : case rel of
     Relation{relType=Child, relTable, relColumns, relFTable, relFColumns} ->
 
@@ -279,18 +279,22 @@ addViewRelations allSyns = concatMap (\rel ->
           fColsSyns = colSynsGroupedByView relFColumns
           getView :: [Synonym] -> Table
           getView = colTable . snd . unsafeHead
-          syns `allSynsOf` cols = S.fromList (fst <$> syns) == S.fromList cols in
+          syns `allSynsOf` cols = S.fromList (fst <$> syns) == S.fromList cols
+          -- Relation is dependent on the order of relColumns and relFColumns to get the join conditions right in the generated query.
+          -- So we need to change the order of the synonyms to match the relColumns
+          -- This could be avoided if the Relation type is improved with a structure that maintains the association of relColumns and relFColumns
+          syns `sortAccordingTo` columns = sortOn (\(k, _) -> L.lookup k $ zip columns [0::Int ..]) syns in
 
-      -- View Table Relations
-      [Relation (getView syns) (snd <$> syns) relFTable relFColumns Child Nothing Nothing Nothing
+      -- View Table Child Relations
+      [Relation (getView syns) (snd <$> syns `sortAccordingTo` relColumns) relFTable relFColumns Child Nothing Nothing Nothing
         | syns <- colsSyns, syns `allSynsOf` relColumns] ++
 
-      -- Table View Relations
-      [Relation relTable relColumns (getView fSyns) (snd <$> fSyns) Child Nothing Nothing Nothing
+      -- Table View Child Relations
+      [Relation relTable relColumns (getView fSyns) (snd <$> fSyns `sortAccordingTo` relFColumns) Child Nothing Nothing Nothing
         | fSyns <- fColsSyns, fSyns `allSynsOf` relFColumns] ++
 
-      -- View View Relations
-      [Relation (getView syns) (snd <$> syns) (getView fSyns) (snd <$> fSyns) Child Nothing Nothing Nothing
+      -- View View Child Relations
+      [Relation (getView syns) (snd <$> syns `sortAccordingTo` relColumns) (getView fSyns) (snd <$> fSyns `sortAccordingTo` relFColumns) Child Nothing Nothing Nothing
         | syns <- colsSyns, fSyns <- fColsSyns, syns `allSynsOf` relColumns, fSyns `allSynsOf` relFColumns]
 
     _ -> [])
@@ -685,68 +689,71 @@ pkFromRow :: [Table] -> (Schema, Text, Text) -> Maybe PrimaryKey
 pkFromRow tabs (s, t, n) = PrimaryKey <$> table <*> pure n
   where table = find (\tbl -> tableSchema tbl == s && tableName tbl == t) tabs
 
-allSynonyms :: [Column] -> H.Statement Schema [Synonym]
-allSynonyms cols =
+allSynonyms :: [Column] -> PgVersion -> H.Statement Schema [Synonym]
+allSynonyms cols pgVer =
   H.Statement sql (HE.param HE.text) (decodeSynonyms cols) True
   -- query explanation at https://gist.github.com/steve-chavez/7ee0e6590cddafb532e5f00c46275569
-  where sql = [q|
-    with
-    views as (
+  where
+    subselectRegex :: Text
+    subselectRegex | pgVer < pgVersion100 = ":subselect {.*?:constraintDeps <>} :location"
+                   | otherwise = ":subselect {.*?:stmt_len 0} :location"
+    sql = [qc|
+      with
+      views as (
+        select
+          n.nspname   as view_schema,
+          c.relname   as view_name,
+          r.ev_action as view_definition
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        join pg_rewrite r on r.ev_class = c.oid
+        where (c.relkind = 'v'::char) and n.nspname = $1
+      ),
+      removed_subselects as(
+        select
+          view_schema, view_name,
+          regexp_replace(view_definition, '{subselectRegex}', '', 'g') as x
+        from views
+      ),
+      target_lists as(
+        select
+          view_schema, view_name,
+          regexp_split_to_array(x, 'targetList') as x
+        from removed_subselects
+      ),
+      last_target_list_wo_tail as(
+        select
+          view_schema, view_name,
+          (regexp_split_to_array(x[array_upper(x, 1)], ':onConflict'))[1] as x
+        from target_lists
+      ),
+      target_entries as(
+        select
+          view_schema, view_name,
+          unnest(regexp_split_to_array(x, 'TARGETENTRY')) as entry
+        from last_target_list_wo_tail
+      ),
+      results as(
+        select
+          view_schema, view_name,
+          substring(entry from ':resname (.*?) :') as view_colum_name,
+          substring(entry from ':resorigtbl (.*?) :') as resorigtbl,
+          substring(entry from ':resorigcol (.*?) :') as resorigcol
+        from target_entries
+      )
       select
-        n.nspname   as view_schema,
-        c.relname   as view_name,
-        r.ev_action as view_definition
-      from pg_class c
-      join pg_namespace n on n.oid = c.relnamespace
-      join pg_rewrite r on r.ev_class = c.oid
-      where (c.relkind = 'v'::char) and n.nspname = $1
-    ),
-    removed_subselects as(
-      select
-        view_schema, view_name,
-        regexp_replace(view_definition, ':subselect {.*?:constraintDeps <>} :location', '', 'g') as x
-      from views
-    ),
-    target_lists as(
-      select
-        view_schema, view_name,
-        regexp_split_to_array(x, 'targetList') as x
-      from removed_subselects
-    ),
-    last_target_list_wo_tail as(
-      select
-        view_schema, view_name,
-        (regexp_split_to_array(x[array_upper(x, 1)], ':onConflict'))[1] as x
-      from target_lists
-    ),
-    target_entries as(
-      select
-        view_schema, view_name,
-        unnest(regexp_split_to_array(x, 'TARGETENTRY')) as entry
-      from last_target_list_wo_tail
-    ),
-    results as(
-      select
-        view_schema, view_name,
-        substring(entry from ':resname (.*?) :') as view_colum_name,
-        substring(entry from ':resorigtbl (.*?) :') as resorigtbl,
-        substring(entry from ':resorigcol (.*?) :') as resorigcol
-      from target_entries
-    )
-    select
-      sch.nspname as table_schema,
-      tbl.relname as table_name,
-      col.attname as table_column_name,
-      res.view_schema,
-      res.view_name,
-      res.view_colum_name
-    from results res
-    join pg_class tbl on tbl.oid::text = res.resorigtbl
-    join pg_attribute col on col.attrelid = tbl.oid and col.attnum::text = res.resorigcol
-    join pg_namespace sch on sch.oid = tbl.relnamespace
-    where resorigtbl <> '0'
-    order by view_schema, view_name, view_colum_name;
-    |]
+        sch.nspname as table_schema,
+        tbl.relname as table_name,
+        col.attname as table_column_name,
+        res.view_schema,
+        res.view_name,
+        res.view_colum_name
+      from results res
+      join pg_class tbl on tbl.oid::text = res.resorigtbl
+      join pg_attribute col on col.attrelid = tbl.oid and col.attnum::text = res.resorigcol
+      join pg_namespace sch on sch.oid = tbl.relnamespace
+      where resorigtbl <> '0'
+      order by view_schema, view_name, view_colum_name; |]
 
 synonymFromRow :: [Column] -> (Text,Text,Text,Text,Text,Text) -> Maybe Synonym
 synonymFromRow allCols (s1,t1,c1,s2,t2,c2) = (,) <$> col1 <*> col2
