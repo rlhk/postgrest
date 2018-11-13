@@ -21,7 +21,7 @@ import           PostgREST.Config              (AppConfig (..), corsPolicy)
 import           PostgREST.Error               (simpleError)
 import           PostgREST.QueryBuilder        (pgFmtLit, unquoted, pgFmtSetLocal)
 
-import           Protolude                     hiding (concat, null)
+import           Protolude
 
 runWithClaims :: AppConfig -> JWTAttempt ->
                  (ApiRequest -> H.Transaction Response) ->
@@ -42,7 +42,7 @@ runWithClaims conf eClaims app req =
         appSettingsSql = pgFmtSetLocal mempty <$> configSettings conf
         setRoleSql = maybeToList $
           (\r -> "set local role " <> r <> ";") . toS . pgFmtLit . unquoted <$> M.lookup "role" claimsWithRole
-        setSchemaSql = ["set schema " <> pgFmtLit (configSchema conf) <> ";"] :: [Text]
+        setSchemaSql = ["set local schema " <> pgFmtLit (configSchema conf) <> ";"] :: [Text]
         -- role claim defaults to anon if not specified in jwt
         claimsWithRole = M.union claims (M.singleton "role" anon)
         anon = JSON.String . toS $ configAnonRole conf
